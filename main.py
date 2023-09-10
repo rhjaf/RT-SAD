@@ -7,12 +7,9 @@ import argparse
 import regex as re
 import time
 from datetime import datetime, timedelta
+from countminsketch import CountMinSketch
+import welford
 
-
-# parser.add_argument('-p', '--protocol', metavar=' ', help= 'To capture packet using ptotocl filter')
-# parser.add_argument('-u', '--udp', action = 'store_true', help = 'To capture udp packet only')
-# parser.add_argument('-t', '--tcp', action = 'store_true', help = 'To capture tcp packet only')
-# parser.add_argument('-v', '--verbose', required = False, action = 'store_true', help = 'To print the all layer of packet')
 
 flows = dict() # Flow data
            # Format: <Endpoint-Port-Endpoint-Port-Portocol> --> { "Type": <Type>, "Start": <Start_Time>, "End": <End_Time>, "Num_Packets": <Num_Packets>,
@@ -40,9 +37,74 @@ TCP_TIMES = "TCP_Times"
 #print(pkt.frame_info.time_epoch) # do not use
 #print(pkt.frame_info.time_relative)
 
+
+
+### setting up command line
+parser = argparse.ArgumentParser()
+parser.add_argument('-i', '--interface', metavar=" ", type=str, required = True, help = 'To specify the interface ')
+parser.add_argument('-o', '--output', metavar=' ', help = 'To capture and save the pcap in a file')
+parser.add_argument('-a', '--alpha', metavar=' ', type=int, help = 'time interval to update alpha')
+
+args = parser.parse_args()
+
+
+
+stat_exist = CountMinSketch(2^11,2)
+stat_asym = CountMinSketch(2^11,2)
+
+detect_asym = CountMinSketch(2^11,2)
+detect_pred = CountMinSketch(2^11,2) # predicate_value
+detect_thld = CountMinSketch(2^11,2)
+
+
+
+n = 10 # the residual aggregation size
+min_alpha = 0.3
+max_alpha = 0.7
+delta_alpha = 0.1
+
+sampling_rate = 10 
+
+update_set = {} # the IPs that their threshold and predicated values are gonna be update at the end of each window
+
+
+res_list = [] # a list of residual sequence for each ip
+alpha_list=[] # a list of min,max,delta alpha for each ip
+
+
+
+def update_predicated(ip):
+  detect_pred[ip] = (1-alpha) * detect_pred[ip] + alpha * stat_asym[ip]
+'''
+the article doesn't say anything about when to update alpha-values
+  but I considered two methods:
+    1 - update it when an attck has been detected (default mode)
+    2 - update it within specific periods defined by -a command
+'''
+
+def update_alpha(ip):
+  current_res = abs(detect_pred[ip]-stat_asym[ip])
+  if current_res > res_list[ip].mean + 3 * res_list[ip].standardDeviation():
+    if alpha_list[ip].get("alpha") < alpha_list[ip].get("max_alpha"):
+      alpha_list[ip] = alpha_list[ip].get("alpha") + alpha_list[ip].get("delta_alpha")
+  elif current_res < res_list[ip].mean() + res_list[ip].standardDdeviation():
+    if alpha_list[ip].get("alpha") < alpha_list[ip].get("min_alpha"):
+      alpha_list[ip]["alpha"] = alpha_list[ip]["alpha"] - alpha_list[ip]["delta_alpha"]
+
+
+
+
+def calculate_detect_threshold(ip): 
+  # runs at the end of each window 
+  res = abs(detect_pred[ip]-stat_asym[ip])
+  res_list[ip].push(res) 
+  ## this is the regular method for calculating threshold
+  #mean ( 0<i<n : res(i)) + 3 *  standard_deviation_of_historical_res_sequence ( radical_variance(0<i<n : res(i)))
+  detect_thld[ip] = res_list[ip].mean() + 3 * res_list[ip].standardDeviation()
+
+
+
 def flowfunc(pkt):
-  
-  LAST_PACKET_TIME = 1.455324301
   if pkt.transport_layer=="TCP" or pkt.transport_layer=="UDP":
     src_port = 0
     dest_port = 0
@@ -53,71 +115,36 @@ def flowfunc(pkt):
       src_port = pkt.udp.srcport
       dest_port = pkt.udp.dstport  
     try:         
-      flow_key = pkt.ip.src + "-" + src_port + "-" + pkt.ip.dst + "-" + dest_port + "-" + pkt.transport_layer
+      flow_key = pkt.ip.src + pkt.ip.dst
     except:
       return
-    if not flow_key in flows:
-      # Might be from the other direction
-      flow_key = pkt.ip.dst + "-" + dest_port + "-" + pkt.ip.src + "-" + src_port + "-" + pkt.transport_layer
-    if not flow_key in flows:
-      # Record this new flow
-      flows[flow_key] = {TYPE: "", START: 0, END: 0, NUM_PACKETS: 0, SIZE: 0, HEADER_SIZE: 0, ARRIVAL_TIME: [], TCP_STATE: "", IS_FAILED: True}
-      flows[flow_key][TYPE] = pkt.transport_layer
-      flows[flow_key][START] = float(pkt.frame_info.time_relative)
-      flows[flow_key][END] = float(pkt.frame_info.time_relative)
-      flows[flow_key][NUM_PACKETS] = 1
-      flows[flow_key][SIZE] = int(pkt.length)
-      if pkt.transport_layer == "TCP":
-        flows[flow_key][HEADER_SIZE] = int(pkt.length) - int(pkt.tcp.len)
-        tcp_state = "Ongoing"
-        if pkt.tcp.flags_syn:
-          tcp_state = "Request"
-        if pkt.tcp.flags_reset:
-          tcp_state = "Reset"
-        if pkt.tcp.flags_fin:
-          tcp_state = "Finished"
-        flows[flow_key][TCP_STATE] = tcp_state
-        if float(pkt.frame_info.time_relative) > (LAST_PACKET_TIME - 300):
-            flows[flow_key][IS_FAILED] = False
-        flows[flow_key][RTT] = dict()
-        flows[flow_key][SEQ] = []
-        flows[flow_key][ACK] = []
-        flows[flow_key][TCP_TIMES] = []
-      flows[flow_key][ARRIVAL_TIME].append(float(pkt.frame_info.time_relative))
+    if res_list[pht.ip.dst] is None:
+      res_list[pkt.ip.dst] = welford()
+      alpha_list[pkt.ip.dst] = {"min_alpha":0.3,"max_alpha":0.7,"delta_alpha":0.1}
+    
+    
+    if stat_exist[flow_key]==0:
+      stat_exist[flow_key] = stat_exist[flow_key]+1
+      flow_key_rev = pkt.ip.dst + pkt.ip.src
+      if stat_exist[flow_key_rev]==0:
+        stat_asym[pkt.ip.src] += stat_asym[pkt.ip.src] 
+      elif stat_exist[flow_key_rev]>0:
+        stat_asym[pkt.ip.src] -= stat_asym[pkt.ip.sr]
+    
+    # ddos detection
+    res = abs(detect_pred[pkt.ip.dst]-stat_asym[pkt.ip.dst])
+    
+    if (res>detect_thld[pkt.ip.dst]):
+      # attack occured
+      print ("[+]","IP ",pkt.ip.dst," is under attack!")
+      if args.alpha is None:
+        update_alpha(pkt.ip.dst)
     else:
-        # add packet to flow
-        flows[flow_key][END] = float(pkt.frame_info.time_relative)
-        flows[flow_key][NUM_PACKETS] =  flows[flow_key][NUM_PACKETS] + 1
-        flows[flow_key][SIZE] = flows[flow_key][SIZE] + int(pkt.length)
-        flows[flow_key][ARRIVAL_TIME].append(float(pkt.frame_info.time_relative))
-        if pkt.transport_layer == "TCP":
-          flows[flow_key][HEADER_SIZE] = flows[flow_key][HEADER_SIZE] + int(pkt.length) - int(pkt.tcp.len)
-          tcp_state = "Ongoing"
-          if pkt.tcp.flags_syn == "Set":
-            tcp_state = "Request"
-          if pkt.tcp.flags_reset == "Set":
-            tcp_state = "Reset"
-          if pkt.tcp.flags_fin == "Set":
-            tcp_state = "Finished"
-          flows[flow_key][TCP_STATE] = tcp_state
-          if float(pkt.frame_info.time_relative) > (LAST_PACKET_TIME - 300):
-            flows[flow_key][IS_FAILED] = False
-    if pkt.transport_layer == "TCP":
-      flows[flow_key][RTT][pkt.tcp.seq] = [float(pkt.sniff_timestamp), -1]
-      flows[flow_key][SEQ].append(pkt.tcp.seq)
-      flows[flow_key][ACK].append(pkt.tcp.ack)
-      flows[flow_key][TCP_TIMES].append(float(pkt.sniff_timestamp))
-
-#for i in range(59):
-#  flowfunc(pcap[i])
+      update_set.add(pkt.ip.dst)
+      
+  
 
 
-
-
-parser = argparse.ArgumentParser()
-parser.add_argument('-i', '--interface', metavar=" ", type=str, required = True, help = 'To specify the interface ')
-parser.add_argument('-o', '--output', metavar=' ', help = 'To capture and save the pcap in a file')
-args = parser.parse_args()
 
 capture = pyshark.LiveCapture(interface=args.interface)
 window_duration = timedelta(seconds=60)
@@ -125,49 +152,43 @@ window_duration = timedelta(seconds=60)
 def process_packets(packet_list):
     for packet in packet_list:
         flowfunc(packet)
-    
+        
     
     
 
 start_time = datetime.now()
 packet_list = []
+counter = 0
+
+
 
 # Capture packets continuously
 for packet in capture.sniff_continuously():
+    if counter !=sampling_rate:
+      continue
+    counter+=1
     packet_list.append(packet)
     elapsed_time = datetime.now() - start_time
     if elapsed_time >= window_duration:
+        # end of time window
         process_packets(packet_list)
+        #### calculate current window res for each ip ==> dip
+        # 
+        ## but we don't store all res for all IPs
+       
+               
+        ### update threshold & predicated_value for each DIP in update_set
+        for ip in update_set:
+          calculate_detect_threshold(ip)
+          update_predicated(ip)
+        
+        
         packet_list = []
         start_time = datetime.now()    
         flows.clear() 
 capture.close()
 
 
-
-'''
-
-
-# Record RTT for each packet (while excluding the retransmitted ones)
-for flow_key in flows:
-  if flows[flow_key][TYPE] == "TCP":
-    for i in range(len(flows[flow_key][SEQ])):
-      seq_num = flows[flow_key][SEQ][i]
-      ack_num = flows[flow_key][ACK][i]
-      time = flows[flow_key][TCP_TIMES][i]
-      if seq_num in flows[flow_key][RTT]:
-        if flows[flow_key][RTT][seq_num][1] == -1:
-          flows[flow_key][RTT][seq_num][1] = 0
-        elif flows[flow_key][RTT][seq_num][1] == 0:
-          flows[flow_key][RTT].pop(seq_num)
-      if ack_num in flows[flow_key][RTT]:
-        if flows[flow_key][RTT][ack_num][1] == 0:
-          flows[flow_key][RTT][ack_num][1] = flows[flow_key][RTT][ack_num][0] - time
-
-
-print(flows)
-
-'''
 
 
 
