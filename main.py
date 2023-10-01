@@ -118,16 +118,15 @@ def flowfunc(pkt):
       flow_key = pkt.ip.src + pkt.ip.dst
     except:
       return
-    if res_list[pht.ip.dst] is None:
+    if res_list[pkt.ip.dst] is None:
       res_list[pkt.ip.dst] = welford()
       alpha_list[pkt.ip.dst] = {"min_alpha":0.3,"max_alpha":0.7,"delta_alpha":0.1}
     
-    
     if stat_exist[flow_key]==0:
-      stat_exist[flow_key] = stat_exist[flow_key]+1
+      stat_exist[flow_key] = stat_exist[flow_key] + 1
       flow_key_rev = pkt.ip.dst + pkt.ip.src
       if stat_exist[flow_key_rev]==0:
-        stat_asym[pkt.ip.src] += stat_asym[pkt.ip.src] 
+        stat_asym[pkt.ip.src] = stat_asym[pkt.ip.src] + 1 
       elif stat_exist[flow_key_rev]>0:
         stat_asym[pkt.ip.src] -= stat_asym[pkt.ip.sr]
     
@@ -164,28 +163,38 @@ counter = 0
 
 # Capture packets continuously
 for packet in capture.sniff_continuously():
+    counter+=1
+    # a packet received
     if counter !=sampling_rate:
       continue
-    counter+=1
+    # process packet:
+    # update stat_asym(dip) in current window
+    #  detect_dip_is_under_attack(stat_asym(dip), (predicate_value, threshold_value ) in history window)
+    flowfunc(packet)
+
     packet_list.append(packet)
+  
     elapsed_time = datetime.now() - start_time
+    
     if elapsed_time >= window_duration:
         # end of time window
-        process_packets(packet_list)
+        print(" a window has been passsed")
+        #f process_packets(packet_list)
         #### calculate current window res for each ip ==> dip
         # 
         ## but we don't store all res for all IPs
        
                
-        ### update threshold & predicated_value for each DIP in update_set
-        for ip in update_set:
-          calculate_detect_threshold(ip)
-          update_predicated(ip)
+        ### update threshold & predicated_value for each normal IP in update_set
+        #ffor ip in update_set:
+        #f  calculate_detect_threshold(ip)
+        #f  update_predicated(ip)
+        ### also update victim IPs whenever they go to normal state
         
-        
-        packet_list = []
-        start_time = datetime.now()    
-        flows.clear() 
+        #f packet_list = []
+        #f start_time = datetime.now()
+        #f # clear sketches    
+        #f flows.clear() 
 capture.close()
 
 
