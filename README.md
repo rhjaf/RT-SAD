@@ -1,3 +1,5 @@
+![alt text](image.png)
+
 Some notes that have been considered during development of RT-SAD
 ```
 sketch size: 2^12 = 4K
